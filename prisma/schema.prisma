@@ -1,0 +1,231 @@
+// Prisma schema — Synthesis Bot dashboard (Tibia OT server "Miracle" 7.4)
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(MEMBER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  scannedPlayers Player[] @relation("PlayerScannedBy")
+  createdEnemies Enemy[]  @relation("EnemyCreatedBy")
+  createdGuilds  Guild[]  @relation("GuildCreatedBy")
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Domain
+// ---------------------------------------------------------------------------
+
+// Characters in Tibia are simply online or offline — no extra combat state.
+enum PlayerStatus {
+  ONLINE
+  OFFLINE
+}
+
+// Allies — guild members tracked by the bot.
+model Player {
+  id         String       @id @default(cuid())
+  name       String
+  level      Int          @default(1)
+  vocation   String?
+  guild      String?
+  status     PlayerStatus @default(OFFLINE)
+  residence  String?
+  avatarUrl  String?
+  notes      String?
+  lastScanAt DateTime?
+
+  scannedById String?
+  scannedBy   User?   @relation("PlayerScannedBy", fields: [scannedById], references: [id], onDelete: SetNull)
+
+  deathEvents DeathEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("players")
+}
+
+// Enemies — rival characters manually curated by an admin (the "hunted list").
+// There's no separate "last login" field: `createdAt` *is* the date the
+// enemy was registered, which is what the UI shows.
+model Enemy {
+  id        String       @id @default(cuid())
+  name      String
+  level     Int          @default(1)
+  vocation  String?
+  // Nome livre da guild — preenchido tanto por quem cadastra um inimigo
+  // avulso (digitado/raspado da ficha) quanto pelo import de guild abaixo
+  // (nesse caso, sempre igual a `guildGroup.name`). Mantido além de
+  // `guildId` pra não quebrar telas que já leem `enemy.guild` como texto.
+  guild     String?
+  residence String?
+  status    PlayerStatus @default(OFFLINE)
+  notes     String?
+
+  // Vínculo com uma Guild CADASTRADA (categoria) — só existe quando o
+  // inimigo veio do import em massa de "Cadastrar Guild inimiga" ou foi
+  // posteriormente associado a uma; um inimigo avulso com guild digitada à
+  // mão fica com isto nulo mesmo tendo `guild` preenchido.
+  guildId    String?
+  guildGroup Guild?  @relation(fields: [guildId], references: [id], onDelete: SetNull)
+
+  createdById String?
+  createdBy   User? @relation("EnemyCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  evidence    EnemyEvidence[]
+  xpRecords   XpRecord[]
+  deathEvents DeathEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId])
+  @@map("enemies")
+}
+
+// Guild inimiga cadastrada via link do site (?subtopic=guilds&action=show&
+// guild=<id>) — importa TODOS os membros como Enemy de uma vez (ver
+// `src/lib/guild-import.ts`). É a "categoria" que agrupa a tela de
+// Inimigos Online por guild.
+model Guild {
+  id   String @id @default(cuid())
+  name String
+
+  // Id da guild no site — permite reimportar/atualizar o elenco sem
+  // duplicar (upsert por este campo).
+  sourceGuildId Int     @unique
+  logoUrl       String?
+
+  members Enemy[]
+
+  createdById String?
+  createdBy   User?   @relation("GuildCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("guilds")
+}
+
+// Screenshots/proof attached to an enemy (e.g. alt-character evidence).
+model EnemyEvidence {
+  id      String @id @default(cuid())
+  enemyId String
+  enemy   Enemy  @relation(fields: [enemyId], references: [id], onDelete: Cascade)
+
+  url     String
+  caption String?
+
+  createdAt DateTime @default(now())
+
+  @@index([enemyId])
+  @@map("enemy_evidence")
+}
+
+// A level/XP snapshot logged for an enemy over time (XP tracker).
+model XpRecord {
+  id      String @id @default(cuid())
+  enemyId String
+  enemy   Enemy  @relation(fields: [enemyId], references: [id], onDelete: Cascade)
+
+  level      Int
+  xpGained   Int?
+  note       String?
+  recordedAt DateTime @default(now())
+
+  @@index([enemyId])
+  @@map("xp_records")
+}
+
+enum DeathSubject {
+  ENEMY
+  ALLY
+}
+
+model DeathEvent {
+  id          String       @id @default(cuid())
+  subjectType DeathSubject
+
+  enemyId  String?
+  enemy    Enemy?  @relation(fields: [enemyId], references: [id], onDelete: Cascade)
+  playerId String?
+  player   Player? @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  // Level do personagem no momento da morte. Opcional porque os registros
+  // manuais existentes (formulário do Last Death) nunca preencheram isso —
+  // só as mortes importadas do OpenTibia Info trazem esse dado.
+  level    Int?
+  killedBy String?
+  cause    String?
+  location String?
+  diedAt   DateTime @default(now())
+
+  @@index([enemyId])
+  @@index([playerId])
+  @@map("death_events")
+}
+
+// ---------------------------------------------------------------------------
+// Loot — item catalog scraped from miracle74.com/?subtopic=items, searched
+// on the Loot page like Player Scan (type a name, see price/weight/NPCs).
+// `sourceId` is that site's own item id, kept for re-scraping/dedup; `name`
+// is NOT unique because Tibia has a few same-named items with different ids
+// (e.g. two "Helmet Of The Ancients").
+// ---------------------------------------------------------------------------
+
+model Item {
+  id        String  @id @default(cuid())
+  sourceId  Int?    @unique
+  name      String
+  category  String?
+  weight    Float?
+  attack    Int?
+  defense   Int?
+  imageUrl  String?
+
+  npcPrices ItemNpcPrice[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+  @@map("items")
+}
+
+// One NPC that buys a given item, and for how much ("sell to" price).
+model ItemNpcPrice {
+  id     String @id @default(cuid())
+  itemId String
+  item   Item   @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  npcName String
+  city    String?
+  price   Int
+
+  @@index([itemId])
+  @@map("item_npc_prices")
+}
